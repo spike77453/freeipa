@@ -571,8 +571,59 @@ class SSLTransport(LanguageAwareTransport):
         self._connection = host, conn
         return self._connection[1]
 
+    def _get_host(self):
+        return self._connection[0]
 
-class KerbTransport(SSLTransport):
+    def _remove_extra_header(self, name):
+        for (h, v) in self._extra_headers:
+            if h == name:
+                self._extra_headers.remove((h, v))
+                break
+
+    if six.PY3:
+        def _send_request(self, connection, host, handler, request_body, debug):
+            # Based on xmlrpc.client.Transport.send_request
+            headers = self._extra_headers[:]
+            if debug:
+                connection.set_debuglevel(1)
+            if self.accept_gzip_encoding and gzip:
+                connection.putrequest("POST", handler, skip_accept_encoding=True)
+                connection.putheader("Accept-Encoding", "gzip")
+                headers.append(("Accept-Encoding", "gzip"))
+            else:
+                connection.putrequest("POST", handler)
+            headers.append(("User-Agent", self.user_agent))
+            self.send_headers(connection, headers)
+            self.send_content(connection, request_body)
+            return connection
+
+
+class CookieTransport(SSLTransport):
+
+    # Find all occurrences of the expiry component
+    expiry_re = re.compile(r'.*?(&expiry=\d+).*?')
+
+    def _slice_session_cookie(self, session_cookie):
+        # Keep only the cookie value and strip away all other info.
+        # This is to reduce the churn on FILE ccaches which grow every time we
+        # set new data. The expiration time for the cookie is set in the
+        # encrypted data anyway and will be enforced by the server
+        http_cookie = session_cookie.http_cookie()
+        # We also remove the "expiry" part from the data which is not required
+        for exp in self.expiry_re.findall(http_cookie):
+            http_cookie = http_cookie.replace(exp, '')
+        return http_cookie
+
+    def parse_response(self, response):
+        if six.PY2:
+            header = response.msg.getheaders('Set-Cookie')
+        else:
+            header = response.msg.get_all('Set-Cookie')
+        self.store_session_cookie(header)
+        return SSLTransport.parse_response(self, response)
+
+
+class KerbTransport(CookieTransport):
     """
     Handles Kerberos Negotiation authentication to an XML-RPC server.
     """
@@ -580,7 +631,7 @@ class KerbTransport(SSLTransport):
              gssapi.RequirementFlag.out_of_sequence_detection]
 
     def __init__(self, *args, **kwargs):
-        SSLTransport.__init__(self, *args, **kwargs)
+        CookieTransport.__init__(self, *args, **kwargs)
         self._sec_context = None
         self.service = kwargs.pop("service", "HTTP")
         self.ccache = kwargs.pop("ccache", None)
@@ -604,14 +655,6 @@ class KerbTransport(SSLTransport):
         else:
             raise errors.KerberosError(message=unicode(e))
 
-    def _get_host(self):
-        return self._connection[0]
-
-    def _remove_extra_header(self, name):
-        for (h, v) in self._extra_headers:
-            if h == name:
-                self._extra_headers.remove((h, v))
-                break
 
     def get_auth_info(self, use_cookie=True):
         """
@@ -706,7 +749,7 @@ class KerbTransport(SSLTransport):
                     self.send_content(h, request_body)
                     response = h.getresponse(buffering=True)
                 else:
-                    self.__send_request(h, host, handler, request_body, verbose)
+                    self._send_request(h, host, handler, request_body, verbose)
                     response = h.getresponse()
 
                 if response.status != 200:
@@ -748,37 +791,6 @@ class KerbTransport(SSLTransport):
                          host, exc_info=True)
             raise
     # pylint: enable=inconsistent-return-statements
-
-    if six.PY3:
-        def __send_request(self, connection, host, handler, request_body, debug):
-            # Based on xmlrpc.client.Transport.send_request
-            headers = self._extra_headers[:]
-            if debug:
-                connection.set_debuglevel(1)
-            if self.accept_gzip_encoding and gzip:
-                connection.putrequest("POST", handler, skip_accept_encoding=True)
-                connection.putheader("Accept-Encoding", "gzip")
-                headers.append(("Accept-Encoding", "gzip"))
-            else:
-                connection.putrequest("POST", handler)
-            headers.append(("User-Agent", self.user_agent))
-            self.send_headers(connection, headers)
-            self.send_content(connection, request_body)
-            return connection
-
-    # Find all occurrences of the expiry component
-    expiry_re = re.compile(r'.*?(&expiry=\d+).*?')
-
-    def _slice_session_cookie(self, session_cookie):
-        # Keep only the cookie value and strip away all other info.
-        # This is to reduce the churn on FILE ccaches which grow every time we
-        # set new data. The expiration time for the cookie is set in the
-        # encrypted data anyway and will be enforced by the server
-        http_cookie = session_cookie.http_cookie()
-        # We also remove the "expiry" part from the data which is not required
-        for exp in self.expiry_re.findall(http_cookie):
-            http_cookie = http_cookie.replace(exp, '')
-        return http_cookie
 
     def store_session_cookie(self, cookie_header):
         '''
@@ -841,14 +853,6 @@ class KerbTransport(SSLTransport):
             # Not fatal, we just can't use the session cookie we were sent.
             pass
 
-    def parse_response(self, response):
-        if six.PY2:
-            header = response.msg.getheaders('Set-Cookie')
-        else:
-            header = response.msg.get_all('Set-Cookie')
-        self.store_session_cookie(header)
-        return SSLTransport.parse_response(self, response)
-
 
 class DelegatedKerbTransport(KerbTransport):
     """
@@ -858,6 +862,143 @@ class DelegatedKerbTransport(KerbTransport):
     flags = [gssapi.RequirementFlag.delegate_to_peer,
              gssapi.RequirementFlag.mutual_authentication,
              gssapi.RequirementFlag.out_of_sequence_detection]
+
+
+class PasswordTransport(CookieTransport):
+
+    def __init__(self, *args, **kwargs):
+        CookieTransport.__init__(self, *args, **kwargs)
+        self.service = kwargs.pop("service", "HTTP")
+        self._user = kwargs.pop("user")
+        self._password = kwargs.pop("password")
+        self.cookie_string = None
+
+    def _authenticate(self, h):
+        if not isinstance(self._extra_headers, list):
+            self._extra_headers = []
+
+        if self.cookie_string:
+            self._extra_headers.append(('Cookie', self.cookie_string))
+            return
+
+        # Remove any existing Cookie first
+        self._remove_extra_header('Cookie')
+
+        host = self._get_host()
+        login_url = f'https://{host}/ipa/session/login_password'
+        headers = {
+            'Referer': login_url,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'text/plain',
+        }
+        data = {
+            "user": self._user,
+            "password": self._password,
+        }
+        request_body = urllib.parse.urlencode(data).encode('utf8')
+        h.request("POST", login_url, request_body, headers=headers)
+
+        response = h.getresponse()
+        self.parse_response(response)
+
+    def single_request(self, host, handler, request_body, verbose=0):
+            # Based on Python 2.7's xmllib.Transport.single_request
+            try:
+                h = self.make_connection(host)
+
+                if verbose:
+                    h.set_debuglevel(1)
+
+                self.verbose = verbose
+                self._authenticate(h)
+
+                while True:
+                    if six.PY2:
+                        # pylint: disable=no-value-for-parameter
+                        self.send_request(h, handler, request_body)
+                        # pylint: enable=no-value-for-parameter
+                        self.send_host(h, host)
+                        self.send_user_agent(h)
+                        self.send_content(h, request_body)
+                        response = h.getresponse(buffering=True)
+                    else:
+                        self._send_request(h, host, handler, request_body, verbose)
+                        response = h.getresponse()
+
+                    if response.status != 200:
+                        # Must read response (even if it is empty)
+                        # before sending another request.
+                        #
+                        # https://docs.python.org/3/library/http.client.html
+                        #   #http.client.HTTPConnection.getresponse
+                        #
+                        # https://pagure.io/freeipa/issue/7752
+                        #
+                        response.read()
+
+                        raise ProtocolError(
+                            host + handler,
+                            response.status, response.reason,
+                            response.msg)
+
+                    return self.parse_response(response)
+            except RemoteDisconnected:
+                # keep-alive connection was terminated by remote peer, close
+                # connection and let transport handle reconnect for us.
+                self.close()
+                logger.debug("HTTP server has closed connection (%s)", host)
+                raise
+            except BaseException:
+                # Unexpected exception may leave connections in a bad state.
+                self.close()
+                logger.debug("HTTP connection destroyed (%s)",
+                            host, exc_info=True)
+                raise
+
+    def store_session_cookie(self, cookie_header):
+        '''
+        Given the contents of a Set-Cookie header scan the header and
+        extract each cookie contained within until the session cookie
+        is located. Examine the session cookie if the domain and path
+        are specified, if not update the cookie with those values from
+        the request URL. If the cookie header is None or the session
+        cookie is not present in the header no action is taken.
+        '''
+
+        if cookie_header is None:
+            return
+
+        request_url = getattr(context, 'request_url', None)
+        logger.debug("received Set-Cookie (%s)'%s'", type(cookie_header),
+                     cookie_header)
+
+        if not isinstance(cookie_header, list):
+            cookie_header = [cookie_header]
+
+        # Search for the session cookie
+        session_cookie = None
+        try:
+            for cookie in cookie_header:
+                session_cookie = (
+                    Cookie.get_named_cookie_from_string(
+                        cookie, COOKIE_NAME, request_url,
+                        timestamp=datetime.datetime.now(
+                            tz=datetime.timezone.utc))
+                    )
+                if session_cookie is not None:
+                    break
+        except Exception as e:
+            logger.error("unable to parse cookie header '%s': %s",
+                         cookie_header, e)
+            return
+
+        if session_cookie is None:
+            return
+
+        cookie_string = self._slice_session_cookie(session_cookie)
+        logger.debug("storing cookie '%s'", cookie_string)
+        self._extra_headers.append(('Cookie', cookie_string))
+        self.cookie_string = cookie_string
 
 
 class RPCClient(Connectible):
@@ -923,7 +1064,8 @@ class RPCClient(Connectible):
         try:
             session_cookie = Cookie.get_named_cookie_from_string(
                 cookie_string, COOKIE_NAME,
-                timestamp=datetime.datetime.now(tz=datetime.timezone.utc))
+                timestamp=datetime.datetime.now(
+                    tz=datetime.timezone.utc))
         except Exception as e:
             logger.debug(
                 'Error retrieving cookie from the persistent storage: %s',
@@ -1001,7 +1143,7 @@ class RPCClient(Connectible):
         return session_url
 
     def create_connection(self, ccache=None, verbose=None, fallback=None,
-                          delegate=None, ca_certfile=None):
+                          delegate=None, ca_certfile=None, user=None, password=None):
         if verbose is None:
             verbose = self.api.env.verbose
         if fallback is None:
@@ -1045,12 +1187,16 @@ class RPCClient(Connectible):
                 if url.startswith('https://'):
                     if delegate:
                         transport_class = DelegatedKerbTransport
+                    elif 'user' in self.api.env and 'password' in self.api.env:
+                        user = self.api.env.user
+                        password = self.api.env.password
+                        transport_class = PasswordTransport
                     else:
                         transport_class = KerbTransport
                 else:
                     transport_class = LanguageAwareTransport
                 proxy_kw['transport'] = transport_class(
-                    protocol=self.protocol, service='HTTP', ccache=ccache)
+                    protocol=self.protocol, service='HTTP', ccache=ccache, user=user, password=password)
                 logger.debug('trying %s', url)
                 setattr(context, 'request_url', url)
                 serverproxy = self.server_proxy_class(url, **proxy_kw)
